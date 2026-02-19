@@ -1,0 +1,6 @@
+logs/
+scripts/GSEA_report_cache/
+scripts/*_cache/
+scripts/*_files/
+*.Rhistory
+.Rproj.user/
