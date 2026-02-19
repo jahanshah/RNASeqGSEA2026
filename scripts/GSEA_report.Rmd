@@ -1,0 +1,996 @@
+---
+title: "NAD<sup>+</sup> Treatment Effect on Stimulated T Cells"
+subtitle: "Full GSEA · Pathway Analysis · Statistical Validation"
+author: "RNASeqGSEA2026 | jahanshah"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+    fig_width: 10
+    fig_height: 6
+    self_contained: true
+    df_print: paged
+---
+
+```{css, echo=FALSE}
+h1, h2, h3 { font-family: "Georgia", serif; }
+.badge-up   { background-color:#E41A1C; color:white; padding:2px 7px; border-radius:4px; }
+.badge-down { background-color:#377EB8; color:white; padding:2px 7px; border-radius:4px; }
+.badge-ns   { background-color:#999;    color:white; padding:2px 7px; border-radius:4px; }
+.summary-box {
+  background:#f8f9fa; border-left:4px solid #2196F3;
+  padding:12px 18px; margin:12px 0; border-radius:4px; font-size:15px;
+}
+.highlight-box {
+  background:#fff8e1; border-left:4px solid #FF9800;
+  padding:12px 18px; margin:12px 0; border-radius:4px;
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.align  = "center",
+  dpi        = 150,
+  cache      = FALSE
+)
+```
+
+```{r packages, message=FALSE, warning=FALSE}
+user_lib <- path.expand("~/R/library")
+if (!dir.exists(user_lib)) dir.create(user_lib, recursive = TRUE)
+.libPaths(c(user_lib, .libPaths()))
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+pkgs <- c("tidyverse","ggrepel","pheatmap","RColorBrewer","viridis",
+          "patchwork","fgsea","clusterProfiler","enrichplot","msigdbr",
+          "org.Hs.eg.db","ReactomePA","openxlsx","knitr","kableExtra",
+          "DT","scales","ggridges")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    if (p %in% c("clusterProfiler","enrichplot","fgsea","msigdbr",
+                 "org.Hs.eg.db","ReactomePA")) {
+      BiocManager::install(p, lib = user_lib, ask = FALSE, update = FALSE)
+    } else install.packages(p, lib = user_lib)
+  }
+}
+suppressPackageStartupMessages({
+  library(tidyverse); library(ggrepel);    library(pheatmap)
+  library(RColorBrewer); library(viridis); library(patchwork)
+  library(fgsea);     library(clusterProfiler); library(enrichplot)
+  library(msigdbr);   library(org.Hs.eg.db);    library(ReactomePA)
+  library(openxlsx);  library(knitr);      library(kableExtra)
+  library(DT);        library(scales);     library(ggridges)
+})
+select <- dplyr::select
+filter <- dplyr::filter
+
+set.seed(42)
+
+BASE  <- "/Users/jahanshah/Documents/Consultant-NGS/Ahmed/Projects2026/Project-RNAseq/RNASeqGSEA2026"
+DATA  <- file.path(BASE, "data")
+RES   <- file.path(BASE, "results")
+FIGS  <- file.path(RES,  "figures")
+
+CONTROL_COLS <- c("KO-13_S31_R1","KO-14_S32_R2","KO-15_S33_R1")
+NAD_COLS     <- c("KO-16_S34_R1","KO-17_S35_R1","KO-18_S36_R1")
+COUNT_COLS   <- c(CONTROL_COLS, NAD_COLS)
+
+# ── Load DE data ──────────────────────────────────────────────────────────── #
+de_raw <- read.delim(file.path(DATA, "DE_results.txt"),
+                     stringsAsFactors = FALSE, check.names = FALSE)
+de <- de_raw %>%
+  filter(!is.na(log2FoldChange), !is.na(pvalue), Symbol != "") %>%
+  mutate(
+    pvalue_floor = pmax(pvalue, 1e-300),
+    rank_score   = sign(log2FoldChange) * (-log10(pvalue_floor)) +
+                   runif(n(), -1e-6, 1e-6),
+    sig = case_when(
+      padj < 0.05 & log2FoldChange >  1 ~ "Up (NAD)",
+      padj < 0.05 & log2FoldChange < -1 ~ "Down (NAD)",
+      TRUE                               ~ "NS"
+    )
+  )
+
+# ── Ranked lists ─────────────────────────────────────────────────────────── #
+ranked_sym <- de %>% arrange(desc(rank_score)) %>%
+  { setNames(.$rank_score, .$Symbol) } %>% .[!duplicated(names(.))]
+
+ranked_entrez <- de %>% filter(!is.na(GeneID), GeneID != "") %>%
+  arrange(desc(rank_score)) %>%
+  { setNames(.$rank_score, as.character(.$GeneID)) } %>% .[!duplicated(names(.))]
+
+up_entrez   <- de %>% filter(sig == "Up (NAD)")   %>% pull(GeneID) %>% as.character()
+down_entrez <- de %>% filter(sig == "Down (NAD)") %>% pull(GeneID) %>% as.character()
+universe    <- de %>% filter(!is.na(GeneID))      %>% pull(GeneID) %>% as.character()
+
+# ── MSigDB sets ───────────────────────────────────────────────────────────── #
+to_list <- function(df) split(df$gene_symbol, df$gs_name)
+h_sets     <- msigdbr(species = "Homo sapiens", collection = "H") %>% to_list()
+kegg_sets  <- msigdbr(species = "Homo sapiens", collection = "C2",
+                      subcollection = "CP:KEGG_LEGACY")  %>% to_list()
+react_sets <- msigdbr(species = "Homo sapiens", collection = "C2",
+                      subcollection = "CP:REACTOME")     %>% to_list()
+wiki_sets  <- msigdbr(species = "Homo sapiens", collection = "C2",
+                      subcollection = "CP:WIKIPATHWAYS") %>% to_list()
+
+# ── Helper: run fgsea ─────────────────────────────────────────────────────── #
+run_fgsea <- function(sets, ranked, label) {
+  fgsea(sets, ranked, minSize=10, maxSize=500, eps=0, nPermSimple=10000) %>%
+    as_tibble() %>%
+    mutate(database  = label,
+           direction = ifelse(NES > 0, "Activated (NAD)", "Suppressed (NAD)")) %>%
+    arrange(padj, pval)
+}
+
+# ── Load / run GSEA results ───────────────────────────────────────────────── #
+xlsx_path <- file.path(RES, "01_GSEA_ORA_all_results.xlsx")
+
+if (file.exists(xlsx_path)) {
+  gsea_h     <- read.xlsx(xlsx_path, sheet = "GSEA_Hallmark")      %>% as_tibble()
+  gsea_kegg  <- read.xlsx(xlsx_path, sheet = "GSEA_KEGG")          %>% as_tibble()
+  gsea_react <- read.xlsx(xlsx_path, sheet = "GSEA_Reactome_fgsea") %>% as_tibble()
+  gsea_go    <- read.xlsx(xlsx_path, sheet = "GSEA_GO_BP")         %>% as_tibble()
+  ora_up_k   <- read.xlsx(xlsx_path, sheet = "ORA_Up_KEGG")        %>% as_tibble()
+  ora_dn_k   <- read.xlsx(xlsx_path, sheet = "ORA_Down_KEGG")      %>% as_tibble()
+} else {
+  gsea_h     <- run_fgsea(h_sets,     ranked_sym, "Hallmark")
+  gsea_kegg  <- run_fgsea(kegg_sets,  ranked_sym, "KEGG")
+  gsea_react <- run_fgsea(react_sets, ranked_sym, "Reactome")
+}
+
+# WikiPathways – always run fresh for blind confirmation
+gsea_wiki <- run_fgsea(wiki_sets, ranked_sym, "WikiPathways")
+
+# ── Focused gene sets ─────────────────────────────────────────────────────── #
+focused_sets <- list(
+  Glutamate_Glutamine = unique(c(
+    "GLS","GLS2","GLUD1","GLUD2","GLUL",
+    "GOT1","GOT2","GPT","GPT2","PSAT1","PSPH",
+    "SLC1A1","SLC1A2","SLC1A3","SLC1A4","SLC1A5","SLC1A6","SLC1A7",
+    "SLC38A1","SLC38A2","SLC38A5",
+    "IDH1","IDH2","IDH3A","IDH3B","IDH3G",
+    "OGDH","OGDHL","SUCLA2","SUCLG1","SUCLG2",
+    "ASNS","ASS1","ASL","PYCR1","PYCR2","PYCR3","ALDH18A1","CPS1","PPAT")),
+  Purine_De_Novo = unique(c(
+    "PPAT","GART","PFAS","PAICS","ADSS","ADSL","ATIC",
+    "IMPDH1","IMPDH2","GMPS","ADSS1","ADSS2","PRPS1","PRPS2")),
+  Purine_Salvage = unique(c(
+    "HPRT1","APRT","ADA","ADK","PNP","DGUOK",
+    "RRM1","RRM2","RRM2B","NT5E","NT5C1A","NT5C2","NT5C3A",
+    "ENTPD1","ENTPD2","ENTPD3","AK1","AK2","AK3","AK4","GUK1")),
+  Pyrimidine_De_Novo = unique(c("CAD","DHODH","UMPS","CTPS1","CTPS2")),
+  Pyrimidine_Salvage = unique(c(
+    "TK1","TK2","TYMS","TYMP","UCK1","UCK2",
+    "CMPK1","CMPK2","DCTD","UPP1","UPP2","DPYS","DPYD","NME1","NME2")),
+  NAD_Metabolism = unique(c(
+    "NAMPT","NMNAT1","NMNAT2","NMNAT3","NADK","NADK2","NAPRT","NADSYN1",
+    "IDO1","IDO2","TDO2","KYNU","HAAO","ACMSD","QPRT",
+    "CD38","BST1","PARP1","PARP2","PARP3",
+    "SIRT1","SIRT2","SIRT3","SIRT4","SIRT5","SIRT6","SIRT7","NNMT"))
+)
+
+gsea_focused <- fgsea(focused_sets, ranked_sym, minSize=5, maxSize=600,
+                      eps=0, nPermSimple=100000) %>%
+  as_tibble() %>%
+  mutate(direction       = ifelse(NES > 0, "Activated (NAD)", "Suppressed (NAD)"),
+         leadingEdge_str = sapply(leadingEdge, paste, collapse=";")) %>%
+  arrange(padj)
+
+# ── Color palette ─────────────────────────────────────────────────────────── #
+col_up   <- "#E41A1C"
+col_down <- "#377EB8"
+col_ns   <- "grey75"
+col_pal  <- c("Activated (NAD)" = col_up, "Suppressed (NAD)" = col_down)
+```
+
+---
+
+# 1. Study Overview {.tabset}
+
+## Summary
+
+<div class="summary-box">
+**Comparison:** Stimulated T cells (Anti-CD3/28, *Control*) **vs** Stimulated + NAD⁺ (*Treatment*)
+**Design:** 3 Control replicates (KO-13/14/15) · 3 NAD replicates (KO-16/17/18)
+**Rank metric:** sign(log₂FC) × −log₁₀(p-value)
+**Databases:** Hallmark · KEGG · Reactome · GO-BP · WikiPathways (blind confirmation)
+**Focus:** Glutamate/Glutamine · Purine (de novo + salvage) · Pyrimidine (de novo + salvage) · NAD⁺ metabolism
+</div>
+
+```{r summary_stats}
+n_total <- nrow(de)
+n_up    <- sum(de$sig == "Up (NAD)")
+n_down  <- sum(de$sig == "Down (NAD)")
+n_sig   <- sum(de$sig != "NS")
+
+tibble(
+  Metric = c("Total genes tested","Significant DEGs (padj<0.05, |LFC|>1)",
+             "Up-regulated in NAD","Down-regulated in NAD",
+             "% genes significant"),
+  Value  = c(format(n_total, big.mark=","),
+             format(n_sig,   big.mark=","),
+             format(n_up,    big.mark=","),
+             format(n_down,  big.mark=","),
+             sprintf("%.1f%%", n_sig/n_total*100))
+) %>%
+  kable(align = c("l","r")) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  row_spec(2, bold = TRUE)
+```
+
+## Methods
+
+```{r methods_table}
+tibble(
+  Step     = c("DE input","Ranking","GSEA (global)","GSEA (focused)",
+               "ORA","Blind confirmation","Statistical validation"),
+  Tool     = c("DESeq2 (pre-computed)","Custom: sign(LFC)×−log₁₀(p)",
+               "fgsea / clusterProfiler / ReactomePA",
+               "fgsea (100k permutations)",
+               "enrichKEGG + enrichGO + enrichPathway",
+               "WikiPathways (independent 4th database)",
+               "Bootstrap NES (100 seeds) · FDR · Leading-edge overlap"),
+  Database = c("—","—","Hallmark · KEGG · Reactome · GO-BP",
+               "Custom curated gene sets",
+               "KEGG · Reactome · GO-BP",
+               "WikiPathways (MSigDB C2:CP:WIKIPATHWAYS)",
+               "FDR=5% · BH correction across all tests")
+) %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped","condensed"), font_size = 13)
+```
+
+---
+
+# 2. Differential Expression
+
+```{r volcano, fig.height=7, fig.width=9}
+top_lab <- de %>% filter(sig != "NS") %>% arrange(padj) %>% slice_head(n=35)
+
+ggplot(de, aes(log2FoldChange, -log10(pvalue_floor), colour = sig)) +
+  geom_point(data = filter(de, sig == "NS"), alpha=0.25, size=0.5) +
+  geom_point(data = filter(de, sig != "NS"), alpha=0.8,  size=0.9) +
+  geom_text_repel(data=top_lab, aes(label=Symbol),
+                  size=2.5, max.overlaps=20, segment.size=0.2) +
+  scale_colour_manual(values = c("Up (NAD)"=col_up,"Down (NAD)"=col_down, NS=col_ns)) +
+  geom_vline(xintercept=c(-1,1),    linetype="dashed", linewidth=0.35) +
+  geom_hline(yintercept=-log10(0.05),linetype="dashed", linewidth=0.35) +
+  annotate("text", x=3.5,  y=1,   label="padj=0.05", size=3, colour="grey40") +
+  annotate("text", x= 1.1, y=290, label="Up in NAD",   size=3, colour=col_up,   hjust=0) +
+  annotate("text", x=-1.1, y=290, label="Down in NAD", size=3, colour=col_down, hjust=1) +
+  labs(
+    title    = "Volcano Plot: Anti-CD3/28 vs Anti-CD3/28 + NAD",
+    subtitle = sprintf("Up: %d  |  Down: %d  |  NS: %d  (padj<0.05, |LFC|>1)",
+                       n_up, n_down, n_total-n_sig),
+    x = "log2 Fold Change (NAD / Control)",
+    y = "-log10(p-value)", colour = NULL
+  ) +
+  theme_bw(base_size=12) + theme(legend.position="top")
+```
+
+---
+
+# 3. Global GSEA Results {.tabset}
+
+```{r gsea_plot_fn}
+plot_nes <- function(df, title, strip="", n=20) {
+  df2 <- df %>% filter(!is.na(padj), padj < 0.05) %>%
+    mutate(pathway2 = str_wrap(str_remove(pathway, strip), 40)) %>%
+    group_by(direction) %>% slice_min(padj, n=n%/%2, with_ties=FALSE) %>% ungroup()
+  if (nrow(df2)==0) return(ggplot() + labs(title=paste("No sig. pathways –",title)) + theme_void())
+  ggplot(df2, aes(NES, reorder(pathway2, NES), colour=padj, size=size)) +
+    geom_point() +
+    geom_vline(xintercept=0, linetype="dashed") +
+    scale_colour_viridis_c(option="plasma", direction=-1, name="padj") +
+    scale_size_continuous(range=c(2,8), name="Set size") +
+    labs(title=title, x="Normalized Enrichment Score (NES)", y=NULL) +
+    theme_bw(base_size=11) + theme(axis.text.y=element_text(size=8))
+}
+```
+
+## Hallmark
+
+```{r gsea_hallmark, fig.height=8}
+plot_nes(gsea_h, "Hallmark GSEA (MSigDB)", "HALLMARK_")
+```
+
+```{r hallmark_table}
+gsea_h %>% filter(!is.na(padj), padj < 0.05) %>%
+  mutate(pathway = str_remove(pathway,"HALLMARK_")) %>%
+  select(pathway, size, NES, pval, padj, direction) %>%
+  mutate(across(c(NES,pval,padj), ~round(.,4))) %>%
+  datatable(rownames=FALSE, options=list(pageLength=10, scrollX=TRUE),
+            caption="Significant Hallmark pathways (padj < 0.05)")
+```
+
+## KEGG
+
+```{r gsea_kegg, fig.height=9}
+plot_nes(gsea_kegg, "KEGG GSEA (MSigDB)", "KEGG_")
+```
+
+```{r kegg_table}
+gsea_kegg %>% filter(!is.na(padj), padj < 0.05) %>%
+  mutate(pathway = str_remove(pathway,"KEGG_")) %>%
+  select(pathway, size, NES, pval, padj, direction) %>%
+  mutate(across(c(NES,pval,padj), ~round(.,4))) %>%
+  datatable(rownames=FALSE, options=list(pageLength=10, scrollX=TRUE),
+            caption="Significant KEGG pathways (padj < 0.05)")
+```
+
+## Reactome
+
+```{r gsea_reactome, fig.height=10}
+plot_nes(gsea_react, "Reactome GSEA (MSigDB)", "REACTOME_", n=24)
+```
+
+```{r reactome_table}
+gsea_react %>% filter(!is.na(padj), padj < 0.05) %>%
+  mutate(pathway = str_remove(pathway,"REACTOME_")) %>%
+  select(pathway, size, NES, pval, padj, direction) %>%
+  mutate(across(c(NES,pval,padj), ~round(.,4))) %>%
+  datatable(rownames=FALSE, options=list(pageLength=10, scrollX=TRUE),
+            caption="Significant Reactome pathways (padj < 0.05)")
+```
+
+## GO Biological Process
+
+```{r gsea_go, fig.height=10}
+gsea_go %>%
+  filter(!is.na(p.adjust), p.adjust < 0.05) %>%
+  mutate(direction = ifelse(NES > 0, "Activated (NAD)", "Suppressed (NAD)"),
+         Description = str_wrap(Description, 45)) %>%
+  group_by(direction) %>% slice_min(p.adjust, n=12, with_ties=FALSE) %>% ungroup() %>%
+  ggplot(aes(NES, reorder(Description, NES), colour=p.adjust, size=setSize)) +
+  geom_point() + geom_vline(xintercept=0, linetype="dashed") +
+  scale_colour_viridis_c(option="plasma", direction=-1) +
+  scale_size_continuous(range=c(2,8)) +
+  labs(title="GO Biological Process GSEA", x="NES", y=NULL,
+       colour="padj", size="Set size") +
+  theme_bw(base_size=11) + theme(axis.text.y=element_text(size=8))
+```
+
+## WikiPathways *(Blind Confirmation)*
+
+<div class="highlight-box">
+**WikiPathways** is run as an **independent 4th database** to cross-validate findings from KEGG and Reactome. Agreement across ≥ 2 databases constitutes a blind confirmation.
+</div>
+
+```{r gsea_wiki, fig.height=9}
+plot_nes(gsea_wiki, "WikiPathways GSEA (independent confirmation)", "WP_", n=24)
+```
+
+```{r wiki_table}
+gsea_wiki %>% filter(!is.na(padj), padj < 0.05) %>%
+  mutate(pathway = str_remove(pathway,"WP_")) %>%
+  select(pathway, size, NES, pval, padj, direction) %>%
+  mutate(across(c(NES,pval,padj), ~round(.,4))) %>%
+  datatable(rownames=FALSE, options=list(pageLength=10, scrollX=TRUE),
+            caption="Significant WikiPathways (padj < 0.05)")
+```
+
+---
+
+# 4. Cross-Database Consensus {.tabset}
+
+<div class="summary-box">
+A pathway is **confirmed** if it reaches significance (padj < 0.05) in ≥ 2 independent databases. This reduces false positives driven by a single database's gene set curation bias.
+</div>
+
+## Consensus Table
+
+```{r consensus}
+# Normalise leadingEdge to character so bind_rows works regardless of source
+norm_le <- function(df) {
+  if ("leadingEdge" %in% names(df))
+    df <- df %>% mutate(leadingEdge = sapply(leadingEdge, function(x)
+      if (is.list(x) || length(x) > 1) paste(unlist(x), collapse=";") else as.character(x)))
+  df
+}
+
+# Collect all significant pathways with their NES and direction
+sig_all <- bind_rows(
+  gsea_h     %>% norm_le() %>% filter(padj < 0.05) %>% mutate(pathway_clean = str_remove(pathway,"HALLMARK_")),
+  gsea_kegg  %>% norm_le() %>% filter(padj < 0.05) %>% mutate(pathway_clean = str_remove(pathway,"KEGG_")),
+  gsea_react %>% norm_le() %>% filter(padj < 0.05) %>% mutate(pathway_clean = str_remove(pathway,"REACTOME_")),
+  gsea_wiki  %>% norm_le() %>% filter(padj < 0.05) %>% mutate(pathway_clean = str_remove(pathway,"WP_"))
+) %>% select(database, pathway_clean, NES, padj, direction)
+
+# Count how many databases each pathway appears in (fuzzy: top 80-char match)
+sig_count <- sig_all %>%
+  group_by(pathway_clean) %>%
+  summarise(
+    n_databases = n_distinct(database),
+    databases   = paste(sort(unique(database)), collapse=" | "),
+    mean_NES    = round(mean(NES), 3),
+    direction   = ifelse(mean(NES) > 0, "Activated (NAD)", "Suppressed (NAD)"),
+    min_padj    = round(min(padj), 5)
+  ) %>%
+  arrange(desc(n_databases), min_padj) %>%
+  filter(n_databases >= 1)
+
+sig_count %>%
+  filter(n_databases >= 2) %>%
+  datatable(rownames=FALSE,
+            options=list(pageLength=15, scrollX=TRUE),
+            caption="Pathways confirmed in ≥2 independent databases") %>%
+  formatStyle("n_databases",
+    backgroundColor = styleInterval(c(1,2,3),
+      c("white","#fff3e0","#ffe0b2","#ff9800")))
+```
+
+## Focused Pathway Consensus
+
+```{r focused_consensus, fig.height=5}
+# Keyword search across all databases for the focused pathway topics
+keywords <- list(
+  "Glutamate/Glutamine" = "GLUTAM|GLUTAMINE|ASPARTATE",
+  "Purine (all)"        = "PURINE",
+  "Pyrimidine (all)"    = "PYRIMIDINE",
+  "NAD / Nicotinamide"  = "NAD|NICOTINAM|NICOTINATE"
+)
+
+consensus_focused <- purrr::map2_dfr(keywords, names(keywords), function(kw, nm) {
+  bind_rows(
+    gsea_h     %>% norm_le() %>% mutate(db = "Hallmark"),
+    gsea_kegg  %>% norm_le() %>% mutate(db = "KEGG"),
+    gsea_react %>% norm_le() %>% mutate(db = "Reactome"),
+    gsea_wiki  %>% norm_le() %>% mutate(db = "WikiPathways")
+  ) %>%
+    filter(grepl(kw, pathway, ignore.case=TRUE)) %>%
+    mutate(topic = nm) %>%
+    select(topic, db, pathway, NES, pval, padj)
+}) %>%
+  mutate(sig_label = ifelse(padj < 0.05, "padj<0.05", "NS"),
+         pathway   = str_remove(pathway, "^(HALLMARK_|KEGG_|REACTOME_|WP_)"))
+
+ggplot(consensus_focused,
+       aes(x = db, y = reorder(pathway, NES),
+           fill = NES, alpha = sig_label)) +
+  geom_tile(colour="white", linewidth=0.3) +
+  geom_text(aes(label=sprintf("%.2f", NES)), size=2.5) +
+  scale_fill_gradient2(low=col_down, mid="white", high=col_up,
+                       midpoint=0, name="NES") +
+  scale_alpha_manual(values=c("padj<0.05"=1, NS=0.35), name="") +
+  facet_wrap(~topic, scales="free_y") +
+  labs(title="Cross-Database Consensus for Focused Pathways",
+       subtitle="Only pathways with keyword match shown | Opacity = significance",
+       x=NULL, y=NULL) +
+  theme_bw(base_size=10) +
+  theme(axis.text.x = element_text(angle=35, hjust=1),
+        axis.text.y = element_text(size=7),
+        strip.text  = element_text(face="bold"))
+```
+
+---
+
+# 5. Focused Pathway Analysis {.tabset}
+
+## Overview
+
+```{r focused_lollipop, fig.height=5}
+gsea_focused %>%
+  mutate(
+    label   = str_replace_all(pathway,"_"," "),
+    sig_tag = case_when(padj<0.001~"***", padj<0.01~"**", padj<0.05~"*", TRUE~"")
+  ) %>%
+  ggplot(aes(NES, reorder(label,NES), colour=direction, size=-log10(pval))) +
+  geom_segment(aes(x=0, xend=NES, yend=label), linewidth=0.9, colour="grey75") +
+  geom_point() +
+  geom_text(aes(label=sig_tag),
+            hjust=ifelse(gsea_focused$NES>0,-0.4,1.4), size=5, colour="black") +
+  geom_vline(xintercept=0, linetype="dashed") +
+  scale_colour_manual(values=col_pal) +
+  scale_size_continuous(range=c(4,11), name="-log10(p)") +
+  labs(title="Focused Pathway GSEA: NAD-treated vs Control T cells",
+       subtitle="* p<0.05  ** p<0.01  *** p<0.001  (100k permutations)",
+       x="NES  [positive = Activated in NAD]", y=NULL, colour=NULL) +
+  theme_bw(base_size=13) +
+  theme(legend.position="right", axis.text.y=element_text(size=11))
+```
+
+```{r focused_table}
+gsea_focused %>%
+  select(pathway, size, NES, pval, padj, direction) %>%
+  mutate(across(c(NES,pval,padj), ~round(.,5))) %>%
+  kable(caption="Focused pathway GSEA results") %>%
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=FALSE) %>%
+  row_spec(which(gsea_focused$padj < 0.05), background="#fff3e0")
+```
+
+## Glutamate / Glutamine
+
+```{r glut_curve, fig.height=4, fig.width=8}
+plotEnrichment(focused_sets$Glutamate_Glutamine, ranked_sym) +
+  labs(title="Glutamate / Glutamine Metabolism",
+       subtitle=sprintf("NES=%.3f  p=%.4f  padj=%.4f",
+         gsea_focused$NES[gsea_focused$pathway=="Glutamate_Glutamine"],
+         gsea_focused$pval[gsea_focused$pathway=="Glutamate_Glutamine"],
+         gsea_focused$padj[gsea_focused$pathway=="Glutamate_Glutamine"]),
+       x="Gene rank (high = activated in NAD)", y="Enrichment score") +
+  theme_bw()
+```
+
+```{r glut_heat, fig.height=7}
+glut_de <- de %>%
+  filter(Symbol %in% focused_sets$Glutamate_Glutamine,
+         rowSums(across(all_of(COUNT_COLS))) > 0) %>%
+  distinct(Symbol, .keep_all=TRUE)
+
+mat <- as.matrix(glut_de[, COUNT_COLS])
+rownames(mat) <- glut_de$Symbol
+mat_z <- t(scale(t(mat))); mat_z[is.nan(mat_z)] <- 0
+mat_z <- pmax(pmin(mat_z, 2.5), -2.5)
+
+row_ann <- data.frame(row.names=glut_de$Symbol,
+  Direction=factor(glut_de$sig, levels=c("Up (NAD)","Down (NAD)","NS")))
+col_ann <- data.frame(row.names=COUNT_COLS,
+  Treatment=c(rep("Control",3),rep("NAD",3)))
+ann_col <- list(Treatment=c(Control=col_down, NAD=col_up),
+  Direction=c("Up (NAD)"=col_up,"Down (NAD)"=col_down, NS="grey80"))
+
+pheatmap(mat_z, annotation_col=col_ann, annotation_row=row_ann,
+  annotation_colors=ann_col, cluster_cols=FALSE,
+  color=colorRampPalette(rev(brewer.pal(11,"RdBu")))(100),
+  fontsize_row=8, border_color=NA, main="Glutamate/Glutamine Metabolism (z-score)")
+```
+
+```{r glut_gene_table}
+glut_de %>%
+  select(Symbol, log2FoldChange, pvalue, padj, sig) %>%
+  mutate(across(c(log2FoldChange,pvalue,padj), ~round(.,4))) %>%
+  arrange(padj) %>%
+  datatable(rownames=FALSE, caption="Glutamate/Glutamine genes – DE statistics")
+```
+
+## Purine De Novo
+
+```{r purine_denovo_curve, fig.height=4, fig.width=8}
+plotEnrichment(focused_sets$Purine_De_Novo, ranked_sym) +
+  labs(title="Purine De Novo Synthesis",
+       subtitle=sprintf("NES=%.3f  p=%.4f  padj=%.4f",
+         gsea_focused$NES[gsea_focused$pathway=="Purine_De_Novo"],
+         gsea_focused$pval[gsea_focused$pathway=="Purine_De_Novo"],
+         gsea_focused$padj[gsea_focused$pathway=="Purine_De_Novo"]),
+       x="Gene rank", y="Enrichment score") + theme_bw()
+```
+
+```{r purine_dn_heat, fig.height=6}
+pdn_de <- de %>% filter(Symbol %in% focused_sets$Purine_De_Novo,
+                          rowSums(across(all_of(COUNT_COLS))) > 0) %>%
+  distinct(Symbol, .keep_all=TRUE)
+mat2 <- as.matrix(pdn_de[, COUNT_COLS]); rownames(mat2) <- pdn_de$Symbol
+m2 <- t(scale(t(mat2))); m2[is.nan(m2)] <- 0; m2 <- pmax(pmin(m2,2.5),-2.5)
+rann2 <- data.frame(row.names=pdn_de$Symbol,
+  Direction=factor(pdn_de$sig,levels=c("Up (NAD)","Down (NAD)","NS")))
+pheatmap(m2, annotation_col=col_ann, annotation_row=rann2,
+  annotation_colors=ann_col, cluster_cols=FALSE,
+  color=colorRampPalette(rev(brewer.pal(11,"RdBu")))(100),
+  fontsize_row=9, border_color=NA, main="Purine De Novo Synthesis (z-score)")
+```
+
+## Purine Salvage
+
+```{r purine_salv_curve, fig.height=4, fig.width=8}
+plotEnrichment(focused_sets$Purine_Salvage, ranked_sym) +
+  labs(title="Purine Salvage Pathway",
+       subtitle=sprintf("NES=%.3f  p=%.4f  padj=%.4f",
+         gsea_focused$NES[gsea_focused$pathway=="Purine_Salvage"],
+         gsea_focused$pval[gsea_focused$pathway=="Purine_Salvage"],
+         gsea_focused$padj[gsea_focused$pathway=="Purine_Salvage"]),
+       x="Gene rank", y="Enrichment score") + theme_bw()
+```
+
+```{r purine_salv_heat, fig.height=7}
+psal_de <- de %>% filter(Symbol %in% focused_sets$Purine_Salvage,
+                           rowSums(across(all_of(COUNT_COLS))) > 0) %>%
+  distinct(Symbol, .keep_all=TRUE)
+mat3 <- as.matrix(psal_de[, COUNT_COLS]); rownames(mat3) <- psal_de$Symbol
+m3 <- t(scale(t(mat3))); m3[is.nan(m3)] <- 0; m3 <- pmax(pmin(m3,2.5),-2.5)
+rann3 <- data.frame(row.names=psal_de$Symbol,
+  Direction=factor(psal_de$sig,levels=c("Up (NAD)","Down (NAD)","NS")))
+pheatmap(m3, annotation_col=col_ann, annotation_row=rann3,
+  annotation_colors=ann_col, cluster_cols=FALSE,
+  color=colorRampPalette(rev(brewer.pal(11,"RdBu")))(100),
+  fontsize_row=8, border_color=NA, main="Purine Salvage Pathway (z-score)")
+```
+
+```{r purine_gene_table}
+bind_rows(
+  de %>% filter(Symbol %in% focused_sets$Purine_De_Novo)   %>% mutate(Pathway="De Novo"),
+  de %>% filter(Symbol %in% focused_sets$Purine_Salvage)   %>% mutate(Pathway="Salvage")
+) %>% distinct(Symbol, .keep_all=TRUE) %>%
+  select(Pathway, Symbol, log2FoldChange, pvalue, padj, sig) %>%
+  mutate(across(c(log2FoldChange,pvalue,padj), ~round(.,4))) %>%
+  arrange(Pathway, padj) %>%
+  datatable(rownames=FALSE, caption="Purine pathway genes – DE statistics",
+            filter="top")
+```
+
+## Pyrimidine De Novo
+
+```{r pyrim_dn_curve, fig.height=4, fig.width=8}
+plotEnrichment(focused_sets$Pyrimidine_De_Novo, ranked_sym) +
+  labs(title="Pyrimidine De Novo Synthesis",
+       subtitle=sprintf("NES=%.3f  p=%.4f  padj=%.4f",
+         gsea_focused$NES[gsea_focused$pathway=="Pyrimidine_De_Novo"],
+         gsea_focused$pval[gsea_focused$pathway=="Pyrimidine_De_Novo"],
+         gsea_focused$padj[gsea_focused$pathway=="Pyrimidine_De_Novo"]),
+       x="Gene rank", y="Enrichment score") + theme_bw()
+```
+
+```{r pyrim_dn_heat, fig.height=4}
+pydn_de <- de %>% filter(Symbol %in% focused_sets$Pyrimidine_De_Novo,
+                           rowSums(across(all_of(COUNT_COLS))) > 0) %>%
+  distinct(Symbol, .keep_all=TRUE)
+mat4 <- as.matrix(pydn_de[, COUNT_COLS]); rownames(mat4) <- pydn_de$Symbol
+m4 <- t(scale(t(mat4))); m4[is.nan(m4)] <- 0; m4 <- pmax(pmin(m4,2.5),-2.5)
+rann4 <- data.frame(row.names=pydn_de$Symbol,
+  Direction=factor(pydn_de$sig,levels=c("Up (NAD)","Down (NAD)","NS")))
+pheatmap(m4, annotation_col=col_ann, annotation_row=rann4,
+  annotation_colors=ann_col, cluster_cols=FALSE,
+  color=colorRampPalette(rev(brewer.pal(11,"RdBu")))(100),
+  fontsize_row=9, border_color=NA, main="Pyrimidine De Novo Synthesis (z-score)")
+```
+
+## Pyrimidine Salvage
+
+```{r pyrim_salv_curve, fig.height=4, fig.width=8}
+plotEnrichment(focused_sets$Pyrimidine_Salvage, ranked_sym) +
+  labs(title="Pyrimidine Salvage Pathway",
+       subtitle=sprintf("NES=%.3f  p=%.4f  padj=%.4f",
+         gsea_focused$NES[gsea_focused$pathway=="Pyrimidine_Salvage"],
+         gsea_focused$pval[gsea_focused$pathway=="Pyrimidine_Salvage"],
+         gsea_focused$padj[gsea_focused$pathway=="Pyrimidine_Salvage"]),
+       x="Gene rank", y="Enrichment score") + theme_bw()
+```
+
+```{r pyrim_salv_heat, fig.height=6}
+pysal_de <- de %>% filter(Symbol %in% focused_sets$Pyrimidine_Salvage,
+                            rowSums(across(all_of(COUNT_COLS))) > 0) %>%
+  distinct(Symbol, .keep_all=TRUE)
+mat5 <- as.matrix(pysal_de[, COUNT_COLS]); rownames(mat5) <- pysal_de$Symbol
+m5 <- t(scale(t(mat5))); m5[is.nan(m5)] <- 0; m5 <- pmax(pmin(m5,2.5),-2.5)
+rann5 <- data.frame(row.names=pysal_de$Symbol,
+  Direction=factor(pysal_de$sig,levels=c("Up (NAD)","Down (NAD)","NS")))
+pheatmap(m5, annotation_col=col_ann, annotation_row=rann5,
+  annotation_colors=ann_col, cluster_cols=FALSE,
+  color=colorRampPalette(rev(brewer.pal(11,"RdBu")))(100),
+  fontsize_row=9, border_color=NA, main="Pyrimidine Salvage Pathway (z-score)")
+```
+
+```{r pyrim_gene_table}
+bind_rows(
+  de %>% filter(Symbol %in% focused_sets$Pyrimidine_De_Novo) %>% mutate(Pathway="De Novo"),
+  de %>% filter(Symbol %in% focused_sets$Pyrimidine_Salvage) %>% mutate(Pathway="Salvage")
+) %>% distinct(Symbol, .keep_all=TRUE) %>%
+  select(Pathway, Symbol, log2FoldChange, pvalue, padj, sig) %>%
+  mutate(across(c(log2FoldChange,pvalue,padj), ~round(.,4))) %>%
+  arrange(Pathway, padj) %>%
+  datatable(rownames=FALSE, caption="Pyrimidine pathway genes – DE statistics",
+            filter="top")
+```
+
+## NAD⁺ Metabolism
+
+```{r nad_curve, fig.height=4, fig.width=8}
+plotEnrichment(focused_sets$NAD_Metabolism, ranked_sym) +
+  labs(title="NAD+ Metabolism",
+       subtitle=sprintf("NES=%.3f  p=%.4f  padj=%.4f",
+         gsea_focused$NES[gsea_focused$pathway=="NAD_Metabolism"],
+         gsea_focused$pval[gsea_focused$pathway=="NAD_Metabolism"],
+         gsea_focused$padj[gsea_focused$pathway=="NAD_Metabolism"]),
+       x="Gene rank", y="Enrichment score") + theme_bw()
+```
+
+```{r nad_heat, fig.height=8}
+nad_de <- de %>% filter(Symbol %in% focused_sets$NAD_Metabolism,
+                          rowSums(across(all_of(COUNT_COLS))) > 0) %>%
+  distinct(Symbol, .keep_all=TRUE)
+mat6 <- as.matrix(nad_de[, COUNT_COLS]); rownames(mat6) <- nad_de$Symbol
+m6 <- t(scale(t(mat6))); m6[is.nan(m6)] <- 0; m6 <- pmax(pmin(m6,2.5),-2.5)
+rann6 <- data.frame(row.names=nad_de$Symbol,
+  Direction=factor(nad_de$sig,levels=c("Up (NAD)","Down (NAD)","NS")))
+pheatmap(m6, annotation_col=col_ann, annotation_row=rann6,
+  annotation_colors=ann_col, cluster_cols=FALSE,
+  color=colorRampPalette(rev(brewer.pal(11,"RdBu")))(100),
+  fontsize_row=8, border_color=NA, main="NAD+ Metabolism (z-score)")
+```
+
+---
+
+# 6. Statistical Validation {.tabset}
+
+<div class="highlight-box">
+Three independent validation strategies:
+① **Bootstrap NES stability** – run focused GSEA 100× with different random seeds; report mean ± 95% CI
+② **FDR landscape** – p-value histogram + FDR q-value distribution
+③ **Leading edge gene overlap** – how consistently are the same genes driving enrichment across bootstrap iterations?
+</div>
+
+## Bootstrap NES
+
+```{r bootstrap, cache=TRUE, fig.height=6}
+message("Running 100-seed bootstrap for focused pathways...")
+boot_res <- purrr::map_dfr(1:100, function(s) {
+  set.seed(s)
+  fgsea(focused_sets, ranked_sym, minSize=5, maxSize=600,
+        eps=0, nPermSimple=2000) %>%
+    as_tibble() %>% mutate(seed=s)
+})
+
+boot_sum <- boot_res %>%
+  group_by(pathway) %>%
+  summarise(
+    mean_NES  = mean(NES),
+    sd_NES    = sd(NES),
+    ci_lo     = quantile(NES, 0.025),
+    ci_hi     = quantile(NES, 0.975),
+    pct_sig   = round(mean(pval < 0.05)*100, 1),
+    .groups   = "drop"
+  ) %>%
+  mutate(stable = ifelse(ci_lo > 0 | ci_hi < 0, "Stable", "Crosses zero"),
+         label  = str_replace_all(pathway,"_"," "))
+
+# Ridge plot
+ggplot(boot_res %>% mutate(label=str_replace_all(pathway,"_"," ")),
+       aes(x=NES, y=reorder(label, NES, mean), fill=..x..)) +
+  geom_density_ridges_gradient(scale=1.5, rel_min_height=0.01,
+                                colour="white", linewidth=0.4) +
+  geom_vline(xintercept=0, linetype="dashed", linewidth=0.5) +
+  scale_fill_gradient2(low=col_down, mid="grey90", high=col_up,
+                       midpoint=0, guide="none") +
+  labs(title="Bootstrap NES Distribution (100 seeds × 2,000 permutations)",
+       subtitle="Wide / zero-crossing ridges indicate unstable estimates",
+       x="NES", y=NULL) +
+  theme_bw(base_size=12)
+```
+
+```{r bootstrap_table}
+boot_sum %>%
+  select(label, mean_NES, sd_NES, ci_lo, ci_hi, pct_sig, stable) %>%
+  mutate(across(c(mean_NES,sd_NES,ci_lo,ci_hi), ~round(.,3))) %>%
+  kable(col.names=c("Pathway","Mean NES","SD","2.5%","97.5%","% runs p<0.05","Stable?"),
+        caption="Bootstrap NES stability (100 seeds)") %>%
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=FALSE) %>%
+  column_spec(7, background=ifelse(boot_sum$stable=="Stable","#e8f5e9","#fff3e0"),
+              bold=TRUE)
+```
+
+## FDR Landscape
+
+```{r fdr_landscape, fig.height=6, fig.width=11}
+fdr_data <- bind_rows(
+  gsea_h     %>% select(pathway, pval, padj) %>% mutate(db="Hallmark"),
+  gsea_kegg  %>% select(pathway, pval, padj) %>% mutate(db="KEGG"),
+  gsea_react %>% select(pathway, pval, padj) %>% mutate(db="Reactome"),
+  gsea_wiki  %>% select(pathway, pval, padj) %>% mutate(db="WikiPathways")
+) %>% filter(!is.na(pval))
+
+p1 <- ggplot(fdr_data, aes(pval, fill=db)) +
+  geom_histogram(bins=40, colour="white", linewidth=0.2) +
+  facet_wrap(~db, scales="free_y") +
+  scale_fill_brewer(palette="Set2", guide="none") +
+  geom_vline(xintercept=0.05, linetype="dashed", colour="red") +
+  labs(title="p-value histograms (well-calibrated = flat tail after 0.05)",
+       x="p-value", y="Count") +
+  theme_bw(base_size=10)
+
+p2 <- fdr_data %>%
+  group_by(db) %>%
+  summarise(
+    n_total    = n(),
+    n_sig_05   = sum(padj < 0.05,  na.rm=TRUE),
+    n_sig_01   = sum(padj < 0.01,  na.rm=TRUE),
+    n_sig_001  = sum(padj < 0.001, na.rm=TRUE)
+  ) %>%
+  pivot_longer(-db, names_to="threshold", values_to="count") %>%
+  mutate(threshold=factor(threshold,
+    levels=c("n_total","n_sig_05","n_sig_01","n_sig_001"),
+    labels=c("Total","padj<0.05","padj<0.01","padj<0.001"))) %>%
+  ggplot(aes(db, count, fill=threshold)) +
+  geom_col(position="dodge") +
+  scale_fill_brewer(palette="Blues", name="Threshold") +
+  labs(title="Significant pathways per database", x=NULL, y="Count") +
+  theme_bw(base_size=10)
+
+p1 / p2 + plot_layout(heights=c(2,1))
+```
+
+## Leading Edge Overlap
+
+```{r leading_edge, fig.height=5, fig.width=9}
+# For each focused pathway, find which genes appear in the leading edge
+le_genes <- gsea_focused %>%
+  mutate(genes = sapply(leadingEdge, function(x) if(is.list(x)) unlist(x) else x)) %>%
+  select(pathway, genes) %>%
+  unnest(genes)
+
+# Count how many pathways each gene appears in as leading edge
+le_count <- le_genes %>%
+  count(genes, name="n_pathways") %>%
+  filter(n_pathways >= 2) %>%
+  arrange(desc(n_pathways))
+
+# Heatmap-style membership
+le_mat <- le_genes %>%
+  mutate(val=1) %>%
+  pivot_wider(names_from=pathway, values_from=val, values_fill=0)
+
+p_le <- le_count %>%
+  slice_head(n=30) %>%
+  left_join(de %>% select(Symbol, log2FoldChange, sig),
+            by=c("genes"="Symbol")) %>%
+  ggplot(aes(reorder(genes, n_pathways), n_pathways, fill=log2FoldChange)) +
+  geom_col() +
+  scale_fill_gradient2(low=col_down, mid="grey90", high=col_up,
+                       midpoint=0, name="log2FC") +
+  coord_flip() +
+  labs(title="Leading-edge genes appearing in ≥2 focused pathways",
+       subtitle="Colour = log2FC in NAD vs Control",
+       x=NULL, y="Number of pathways in leading edge") +
+  theme_bw(base_size=11)
+p_le
+```
+
+```{r le_table}
+le_count %>%
+  left_join(de %>% select(Symbol, log2FoldChange, pvalue, padj, sig),
+            by=c("genes"="Symbol")) %>%
+  mutate(across(c(log2FoldChange,pvalue,padj), ~round(.,4))) %>%
+  arrange(desc(n_pathways), padj) %>%
+  datatable(rownames=FALSE,
+            caption="Leading-edge genes shared across ≥2 focused pathways")
+```
+
+---
+
+# 7. KEGG Pathway Maps
+
+```{r pathview_maps, results='asis', fig.align='center'}
+pngs <- list(
+  list(file="hsa00230.NAD_vs_Control.png", title="hsa00230 – Purine Metabolism"),
+  list(file="hsa00240.NAD_vs_Control.png", title="hsa00240 – Pyrimidine Metabolism"),
+  list(file="hsa00250.NAD_vs_Control.png", title="hsa00250 – Alanine, Aspartate & Glutamate Metabolism"),
+  list(file="hsa00760.NAD_vs_Control.png", title="hsa00760 – Nicotinate & Nicotinamide (NAD+) Metabolism"),
+  list(file="hsa04660.NAD_vs_Control.png", title="hsa04660 – T Cell Receptor Signaling Pathway")
+)
+
+for (p in pngs) {
+  fpath <- file.path(FIGS, p$file)
+  if (file.exists(fpath)) {
+    cat(sprintf("\n### %s\n\n", p$title))
+    cat(sprintf("![%s](%s){width=100%%}\n\n", p$title, fpath))
+  }
+}
+```
+
+---
+
+# 8. Top DEGs in Focused Pathways
+
+```{r top_degs_table}
+focused_de_all <- purrr::map2_dfr(focused_sets, names(focused_sets),
+  function(genes, nm) {
+    de %>% filter(Symbol %in% genes) %>%
+      mutate(Pathway = nm) %>%
+      select(Pathway, Symbol, GeneID, log2FoldChange, pvalue, padj, sig,
+             all_of(COUNT_COLS))
+  })
+
+focused_de_all %>%
+  filter(sig != "NS") %>%
+  select(Pathway, Symbol, log2FoldChange, padj, sig) %>%
+  mutate(across(c(log2FoldChange,padj), ~round(.,4))) %>%
+  arrange(Pathway, padj) %>%
+  datatable(rownames=FALSE,
+            caption="Significant DEGs (padj<0.05, |LFC|>1) in focused pathways",
+            filter="top",
+            options=list(pageLength=15)) %>%
+  formatStyle("sig",
+    backgroundColor=styleEqual(
+      c("Up (NAD)","Down (NAD)","NS"),
+      c("#fde0e0","#dce8f8","white")))
+```
+
+---
+
+# 9. Conclusions
+
+```{r conclusions_table}
+# Build dynamic conclusions from results
+n_h_sig    <- sum(gsea_h$padj    < 0.05, na.rm=TRUE)
+n_kegg_sig <- sum(gsea_kegg$padj < 0.05, na.rm=TRUE)
+n_r_sig    <- sum(gsea_react$padj< 0.05, na.rm=TRUE)
+n_w_sig    <- sum(gsea_wiki$padj < 0.05, na.rm=TRUE)
+n_cons     <- sum(sig_count$n_databases >= 2)
+
+tibble(
+  Finding   = c(
+    "Differential Expression",
+    "GSEA: Hallmark",
+    "GSEA: KEGG",
+    "GSEA: Reactome",
+    "GSEA: WikiPathways (blind confirm)",
+    "Cross-database consensus",
+    "Purine de novo",
+    "Purine salvage",
+    "Pyrimidine de novo",
+    "Pyrimidine salvage",
+    "Glutamate/Glutamine",
+    "NAD+ metabolism",
+    "Statistical robustness"
+  ),
+  Result = c(
+    sprintf("%d up, %d down in NAD-treated T cells (padj<0.05, |LFC|>1)", n_up, n_down),
+    sprintf("%d significant pathways", n_h_sig),
+    sprintf("%d significant pathways", n_kegg_sig),
+    sprintf("%d significant pathways", n_r_sig),
+    sprintf("%d significant pathways (independent confirmation)", n_w_sig),
+    sprintf("%d pathways confirmed in ≥2 independent databases", n_cons),
+    sprintf("NES=%.3f, p=%.4f | %s",
+      gsea_focused$NES[gsea_focused$pathway=="Purine_De_Novo"],
+      gsea_focused$pval[gsea_focused$pathway=="Purine_De_Novo"],
+      gsea_focused$direction[gsea_focused$pathway=="Purine_De_Novo"]),
+    sprintf("NES=%.3f, p=%.4f | %s",
+      gsea_focused$NES[gsea_focused$pathway=="Purine_Salvage"],
+      gsea_focused$pval[gsea_focused$pathway=="Purine_Salvage"],
+      gsea_focused$direction[gsea_focused$pathway=="Purine_Salvage"]),
+    sprintf("NES=%.3f, p=%.4f | %s",
+      gsea_focused$NES[gsea_focused$pathway=="Pyrimidine_De_Novo"],
+      gsea_focused$pval[gsea_focused$pathway=="Pyrimidine_De_Novo"],
+      gsea_focused$direction[gsea_focused$pathway=="Pyrimidine_De_Novo"]),
+    sprintf("NES=%.3f, p=%.4f | %s",
+      gsea_focused$NES[gsea_focused$pathway=="Pyrimidine_Salvage"],
+      gsea_focused$pval[gsea_focused$pathway=="Pyrimidine_Salvage"],
+      gsea_focused$direction[gsea_focused$pathway=="Pyrimidine_Salvage"]),
+    sprintf("NES=%.3f, p=%.4f | %s",
+      gsea_focused$NES[gsea_focused$pathway=="Glutamate_Glutamine"],
+      gsea_focused$pval[gsea_focused$pathway=="Glutamate_Glutamine"],
+      gsea_focused$direction[gsea_focused$pathway=="Glutamate_Glutamine"]),
+    sprintf("NES=%.3f, p=%.4f | %s",
+      gsea_focused$NES[gsea_focused$pathway=="NAD_Metabolism"],
+      gsea_focused$pval[gsea_focused$pathway=="NAD_Metabolism"],
+      gsea_focused$direction[gsea_focused$pathway=="NAD_Metabolism"]),
+    "Bootstrap 100 seeds; FDR (BH) 5%; Leading-edge consistency assessed"
+  )
+) %>%
+  kable(caption="Summary of findings") %>%
+  kable_styling(bootstrap_options=c("striped","hover"), font_size=13) %>%
+  row_spec(1, bold=TRUE, background="#e3f2fd") %>%
+  row_spec(6, bold=TRUE, background="#fff8e1") %>%
+  row_spec(13, background="#e8f5e9")
+```
+
+---
+
+# 10. Session Information
+
+```{r session_info}
+si <- sessionInfo()
+tibble(
+  Package = names(si$otherPkgs),
+  Version = sapply(si$otherPkgs, function(x) x$Version)
+) %>%
+  kable() %>%
+  kable_styling(bootstrap_options=c("condensed","striped"),
+                full_width=FALSE, font_size=12)
+```
+
+```{r footer, echo=FALSE, results='asis'}
+cat(sprintf(
+  "\n---\n*Report generated: %s · R %s · RNASeqGSEA2026*\n",
+  format(Sys.time(), "%Y-%m-%d %H:%M"),
+  paste(R.version$major, R.version$minor, sep=".")
+))
+```

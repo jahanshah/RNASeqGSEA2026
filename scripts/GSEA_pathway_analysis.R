@@ -51,6 +51,11 @@ suppressPackageStartupMessages({
   library(ggrepel)
 })
 
+# Resolve namespace conflicts: AnnotationDbi & clusterProfiler mask dplyr
+select <- dplyr::select
+filter <- dplyr::filter
+rename <- dplyr::rename
+
 # ── 2. PATHS ─────────────────────────────────────────────────────────────── #
 BASE <- "/Users/jahanshah/Documents/Consultant-NGS/Ahmed/Projects2026/Project-RNAseq/RNASeqGSEA2026"
 DATA <- file.path(BASE, "data")
@@ -67,13 +72,15 @@ COUNT_COLS   <- c(CONTROL_COLS, NAD_COLS)
 
 # ── 3. LOAD & PROCESS DE RESULTS ─────────────────────────────────────────── #
 message("Loading DE results...")
-de_raw <- read.delim(file.path(DATA, "DE_results.txt"), stringsAsFactors = FALSE)
+de_raw <- read.delim(file.path(DATA, "DE_results.txt"),
+                     stringsAsFactors = FALSE, check.names = FALSE)
 
 de <- de_raw %>%
   filter(!is.na(log2FoldChange), !is.na(pvalue), Symbol != "") %>%
   mutate(
     pvalue_floor = pmax(pvalue, 1e-300),           # floor for -log10
-    rank_score   = sign(log2FoldChange) * (-log10(pvalue_floor)),
+    rank_score   = sign(log2FoldChange) * (-log10(pvalue_floor)) +
+                   runif(n(), -1e-6, 1e-6),       # tiny jitter breaks ties
     sig = case_when(
       padj < 0.05 & log2FoldChange >  1 ~ "Up (NAD)",
       padj < 0.05 & log2FoldChange < -1 ~ "Down (NAD)",
@@ -111,8 +118,8 @@ p_volcano <- ggplot(de, aes(log2FoldChange, -log10(pvalue_floor), colour = sig))
       "Up in NAD: %d | Down in NAD: %d  (padj < 0.05, |LFC| > 1)",
       sum(de$sig == "Up (NAD)"), sum(de$sig == "Down (NAD)")
     ),
-    x      = "log\u2082 Fold Change  (NAD / Control)",
-    y      = "-log\u2081\u2080(p-value)",
+    x      = "log2 Fold Change  (NAD / Control)",
+    y      = "-log10(p-value)",
     colour = NULL
   ) +
   theme_bw(base_size = 12) +
@@ -147,11 +154,11 @@ message("Loading MSigDB gene sets...")
 
 to_list <- function(df) split(df$gene_symbol, df$gs_name)
 
-h_sets     <- msigdbr(species = "Homo sapiens", category = "H") %>% to_list()
-kegg_sets  <- msigdbr(species = "Homo sapiens", category = "C2",
-                      subcategory = "CP:KEGG_LEGACY") %>% to_list()
-react_sets <- msigdbr(species = "Homo sapiens", category = "C2",
-                      subcategory = "CP:REACTOME") %>% to_list()
+h_sets     <- msigdbr(species = "Homo sapiens", collection = "H") %>% to_list()
+kegg_sets  <- msigdbr(species = "Homo sapiens", collection = "C2",
+                      subcollection = "CP:KEGG_LEGACY") %>% to_list()
+react_sets <- msigdbr(species = "Homo sapiens", collection = "C2",
+                      subcollection = "CP:REACTOME") %>% to_list()
 
 # ── 7. FULL PRERANKED GSEA (fgsea) ───────────────────────────────────────── #
 run_fgsea <- function(pathways, ranked, label, nPerm = 10000) {
@@ -160,6 +167,7 @@ run_fgsea <- function(pathways, ranked, label, nPerm = 10000) {
         stats       = ranked,
         minSize     = 10,
         maxSize     = 500,
+        eps         = 0,
         nPermSimple = nPerm) %>%
     as_tibble() %>%
     mutate(
@@ -183,6 +191,7 @@ gsea_go <- gseGO(
   minGSSize    = 10,
   maxGSSize    = 500,
   pvalueCutoff = 0.05,
+  eps          = 0,
   nPermSimple  = 10000,
   verbose      = FALSE
 )
@@ -194,6 +203,7 @@ gsea_reactome_pa <- gsePathway(
   minGSSize    = 10,
   maxGSSize    = 500,
   pvalueCutoff = 0.05,
+  eps          = 0,
   verbose      = FALSE
 )
 
@@ -299,7 +309,7 @@ plot_ora_bar <- function(obj, title) {
     geom_col() +
     scale_fill_viridis_c(option = "magma") +
     coord_flip() +
-    labs(title = title, x = NULL, y = "-log\u2081\u2080(adj. p-value)") +
+    labs(title = title, x = NULL, y = "-log10(adj. p-value)") +
     theme_bw(base_size = 10) +
     theme(legend.position = "none")
 }
@@ -445,6 +455,7 @@ gsea_focused <- fgsea(
   stats       = ranked_sym,
   minSize     = 5,
   maxSize     = 600,
+  eps         = 0,
   nPermSimple = 100000
 ) %>%
   as_tibble() %>%
@@ -624,11 +635,11 @@ p_lollipop <- gsea_focused %>%
   scale_colour_manual(
     values = c("Activated (NAD)" = "#E41A1C", "Suppressed (NAD)" = "#377EB8")
   ) +
-  scale_size_continuous(range = c(4, 11), name = "-log\u2081\u2080(p)") +
+  scale_size_continuous(range = c(4, 11), name = "-log10(p)") +
   labs(
     title    = "Focused Pathway GSEA: NAD-treated vs Control T cells",
     subtitle = "Significance: * p<0.05  ** p<0.01  *** p<0.001",
-    x = "Normalized Enrichment Score (NES)  \u2192  Activated in NAD",
+    x = "Normalized Enrichment Score (NES)  [+ = Activated in NAD]",
     y = NULL, colour = NULL
   ) +
   theme_bw(base_size = 13) +
