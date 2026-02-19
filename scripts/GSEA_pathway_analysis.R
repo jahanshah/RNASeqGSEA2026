@@ -13,9 +13,14 @@
 #       Section 17 for the integration stub.
 # =============================================================================
 
+# ── 0. PERSONAL LIBRARY (avoids system-level permission errors) ───────────── #
+user_lib <- path.expand("~/R/library")
+if (!dir.exists(user_lib)) dir.create(user_lib, recursive = TRUE)
+.libPaths(c(user_lib, .libPaths()))   # personal lib takes priority
+
 # ── 1. PACKAGES ──────────────────────────────────────────────────────────── #
 if (!requireNamespace("BiocManager", quietly = TRUE))
-  install.packages("BiocManager")
+  install.packages("BiocManager", lib = user_lib)
 
 bioc_pkgs <- c("clusterProfiler", "enrichplot", "fgsea", "msigdbr",
                "org.Hs.eg.db", "ReactomePA", "DOSE", "pathview")
@@ -23,9 +28,11 @@ cran_pkgs <- c("tidyverse", "ggrepel", "pheatmap", "RColorBrewer",
                "viridis", "patchwork", "openxlsx")
 
 for (p in bioc_pkgs)
-  if (!requireNamespace(p, quietly = TRUE)) BiocManager::install(p, ask = FALSE)
+  if (!requireNamespace(p, quietly = TRUE))
+    BiocManager::install(p, lib = user_lib, ask = FALSE, update = FALSE)
 for (p in cran_pkgs)
-  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+  if (!requireNamespace(p, quietly = TRUE))
+    install.packages(p, lib = user_lib)
 
 suppressPackageStartupMessages({
   library(tidyverse)
